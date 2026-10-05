@@ -1,0 +1,217 @@
+diff --git a/librecomp/include/librecomp/addresses.hpp b/librecomp/include/librecomp/addresses.hpp
+index b1b50cb..e1be212 100644
+--- a/librecomp/include/librecomp/addresses.hpp
++++ b/librecomp/include/librecomp/addresses.hpp
+@@ -6,10 +6,17 @@
+ #include "recomp.h"
+ 
+ namespace recomp {
++#if defined(__vita__)
++    // PS Vita: 32 MiB covers the game's RDRAM (8 MiB), the runtime and patch data at 0x80800000,
++    // and leaves 16 MiB for the heap above mod_rdram_start. A 32-bit process cannot reserve 4GB.
++    constexpr size_t mem_size = 32ULL * 1024ULL * 1024ULL;
++    constexpr size_t allocation_size = mem_size;
++#else
+     // 512GB (kseg0 size)
+     constexpr size_t mem_size = 512ULL * 1024ULL * 1024ULL;
+     // 4GB (the full address space)
+     constexpr size_t allocation_size = 4096ULL * 1024ULL * 1024ULL;
++#endif
+     // We need a place in rdram to hold the PI handles, so pick an address in extended rdram
+     constexpr int32_t cart_handle = 0x80800000;
+     constexpr int32_t drive_handle = (int32_t)(cart_handle + sizeof(OSPiHandle));
+diff --git a/librecomp/include/librecomp/mods.hpp b/librecomp/include/librecomp/mods.hpp
+index 37556bd..097ef58 100644
+--- a/librecomp/include/librecomp/mods.hpp
++++ b/librecomp/include/librecomp/mods.hpp
+@@ -50,12 +50,17 @@ template <>
+ struct std::hash<recomp::mods::HookDefinition>
+ {
+     std::size_t operator()(const recomp::mods::HookDefinition& def) const {
+-        // This hash packing only works if the resulting value is 64 bits.
+-        static_assert(sizeof(std::size_t) == 8);
+         // Combine the three values into a single 64-bit value.
+         // The lower 2 bits of a function address will always be zero, so pack
+         // the value of at_return into the lowest bit.
+-        return (size_t(def.section_rom) << 32) | size_t(def.function_vram) | size_t(def.at_return ? 1 : 0);
++        const uint64_t packed = (uint64_t(def.section_rom) << 32) | uint64_t(def.function_vram) | uint64_t(def.at_return ? 1 : 0);
++        if constexpr (sizeof(std::size_t) == 8) {
++            return std::size_t(packed);
++        }
++        else {
++            // On 32-bit targets (PS Vita) size_t cannot hold the packed value, so hash it instead.
++            return std::hash<uint64_t>{}(packed);
++        }
+     }
+ };
+ 
+diff --git a/librecomp/src/mods.cpp b/librecomp/src/mods.cpp
+index 0f7de83..747432e 100644
+--- a/librecomp/src/mods.cpp
++++ b/librecomp/src/mods.cpp
+@@ -74,6 +74,9 @@ bool get_to_vec(const nlohmann::json& val, std::vector<T2>& out) {
+ // MSVC/GCC/Clang ARM64
+ #elif defined(__ARM_ARCH_ISA_A64)
+ #   define IS_ARM64
++// PS Vita: code memory is read-only and native mods cannot be loaded, so function patching is disabled.
++#elif defined(__vita__)
++#   define IS_VITA
+ #else
+ #   error "Unsupported architecture!"
+ #endif
+@@ -165,6 +168,41 @@ void protect(void* target_func, uint64_t old_flags) {
+         &dummy_old_flags);
+     (void)result;
+ }
++#elif defined(__vita__)
++// The Vita has no dynamic library loader for native mods. Every native library fails to open.
++class recomp::mods::DynamicLibrary {
++public:
++    static constexpr std::string_view PlatformExtension = ".suprx";
++    DynamicLibrary() = default;
++    DynamicLibrary(const std::filesystem::path& path) {}
++    ~DynamicLibrary() = default;
++    DynamicLibrary(const DynamicLibrary&) = delete;
++    DynamicLibrary& operator=(const DynamicLibrary&) = delete;
++    DynamicLibrary(DynamicLibrary&&) = delete;
++    DynamicLibrary& operator=(DynamicLibrary&&) = delete;
++
++    void unload() {}
++
++    bool good() const {
++        return false;
++    }
++
++    template <typename T>
++    bool get_dll_symbol(T& out, const char* name) const {
++        out = nullptr;
++        return false;
++    };
++
++    uint32_t get_api_version() {
++        return (uint32_t)-1;
++    }
++};
++
++void unprotect(void* target_func, uint64_t* old_flags) {
++    *old_flags = 0;
++}
++
++void protect(void* target_func, uint64_t old_flags) {}
+ #else
+ #  include <unistd.h>
+ #  include <dlfcn.h>
+@@ -585,6 +623,10 @@ void patch_func(recomp_func_t* target_func, recomp::mods::GenericFunction replac
+            write_bytes(&native_func, sizeof(&native_func));
+         }
+     }, replacement_func);
++#elif defined(IS_VITA)
++    // Function patching is not supported on the Vita.
++    (void)write_bytes;
++    (void)replacement_func;
+ #else
+ #   error "Unsupported architecture"
+ #endif
+diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
+index 1200f77..9a4a823 100644
+--- a/librecomp/src/recomp.cpp
++++ b/librecomp/src/recomp.cpp
+@@ -28,6 +28,8 @@
+ #ifdef _WIN32
+ #    define WIN32_LEAN_AND_MEAN
+ #    include <Windows.h>
++#elif defined(__vita__)
++#    include <cstdlib>
+ #else
+ #    include <sys/mman.h>
+ #endif
+@@ -851,6 +853,11 @@ void recomp::start(
+             VirtualFree(rdram, 0, MEM_RELEASE);
+         }
+     }
++#elif defined(__vita__)
++    // No virtual memory reservation on the Vita: allocate exactly mem_size, zeroed. There is no
++    // guard region above it, so out-of-range accesses are not caught.
++    rdram = (uint8_t*)calloc(1, mem_size);
++    alloc_failed = (rdram == nullptr);
+ #else
+     rdram = (uint8_t*)mmap(NULL, allocation_size, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
+     alloc_failed = rdram == reinterpret_cast<uint8_t*>(MAP_FAILED);
+@@ -904,6 +911,9 @@ void recomp::start(
+ #ifdef _WIN32
+     // VirtualFree returns zero on failure.
+     free_failed = (VirtualFree(rdram, 0, MEM_RELEASE) == 0);
++#elif defined(__vita__)
++    std::free(rdram);
++    free_failed = false;
+ #else
+     // munmap returns -1 on failure.
+     free_failed = (munmap(rdram, allocation_size) == -1);
+diff --git a/thirdparty/concurrentqueue/lightweightsemaphore.h b/thirdparty/concurrentqueue/lightweightsemaphore.h
+index 41ba094..e79968e 100644
+--- a/thirdparty/concurrentqueue/lightweightsemaphore.h
++++ b/thirdparty/concurrentqueue/lightweightsemaphore.h
+@@ -24,7 +24,7 @@ extern "C" {
+ }
+ #elif defined(__MACH__)
+ #include <mach/mach.h>
+-#elif defined(__unix__)
++#elif defined(__unix__) || defined(__vita__)
+ #include <semaphore.h>
+ 
+ #if defined(__GLIBC_PREREQ) && defined(_GNU_SOURCE)
+@@ -165,7 +165,7 @@ public:
+ 		}
+ 	}
+ };
+-#elif defined(__unix__)
++#elif defined(__unix__) || defined(__vita__)
+ //---------------------------------------------------------
+ // Semaphore (POSIX, Linux)
+ //---------------------------------------------------------
+diff --git a/ultramodern/include/ultramodern/renderer_context.hpp b/ultramodern/include/ultramodern/renderer_context.hpp
+index d60c4ec..1e86acc 100644
+--- a/ultramodern/include/ultramodern/renderer_context.hpp
++++ b/ultramodern/include/ultramodern/renderer_context.hpp
+@@ -62,6 +62,12 @@ namespace ultramodern {
+             void* view;
+             auto operator<=>(const WindowHandle&) const = default;
+         };
++#elif defined(__vita__)
++        // The Vita has no windowing system; the renderer owns the display directly.
++        struct WindowHandle {
++            void* window = nullptr;
++            auto operator<=>(const WindowHandle&) const = default;
++        };
+ #endif
+ 
+         enum class SetupResult {
+diff --git a/ultramodern/src/error_handling.cpp b/ultramodern/src/error_handling.cpp
+index 8ca779e..1e250b8 100644
+--- a/ultramodern/src/error_handling.cpp
++++ b/ultramodern/src/error_handling.cpp
+@@ -21,7 +21,7 @@ void ultramodern::error_handling::message_box(const char* msg) {
+ void ultramodern::error_handling::quick_exit(const char* filename, int line, const char *func, int exit_status) {
+     fprintf(stderr, "Exiting with exit status '%i'. Function %s, at file %s:%i\n", exit_status, func, filename, line);
+ 
+-#ifdef __APPLE__
++#if defined(__APPLE__) || defined(__vita__)
+     std::_Exit(exit_status);
+ #else
+     std::quick_exit(exit_status);
+diff --git a/ultramodern/src/threads.cpp b/ultramodern/src/threads.cpp
+index 812c556..333c322 100644
+--- a/ultramodern/src/threads.cpp
++++ b/ultramodern/src/threads.cpp
+@@ -143,6 +143,11 @@ void ultramodern::set_native_thread_name(const std::string& name) {
+     pthread_setname_np(name.c_str());
+ }
+ 
++void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
++#elif defined(__vita__)
++// Vita threads are named at creation and std::thread offers no way to rename them afterwards.
++void ultramodern::set_native_thread_name(const std::string& name) {}
++
+ void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
+ #endif
+ 

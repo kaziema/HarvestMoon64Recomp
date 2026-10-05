@@ -72,3 +72,7 @@ RSPRecomp
 
 # Controller mappings file
 gamecontrollerdb.txt
+
+# Vita build output and host tools
+build-vita/
+vita/host-tools/

@@ -1,0 +1,63 @@
+diff --git a/include/recomp.h b/include/recomp.h
+index 73f3e73..4f536c0 100644
+--- a/include/recomp.h
++++ b/include/recomp.h
+@@ -27,7 +27,13 @@
+     // Use GCC's attribute for disabling inter-procedural optimizations. Also enable the rounding-math compiler flag to disable
+     // constant folding so that arithmetic respects the floating point environment. This is needed because gcc doesn't implement
+     // any FENV_ACCESS pragma.
+-    #define RECOMP_FUNC __attribute__((noipa, optimize("rounding-math")))
++    #if defined(__vita__)
++        // PS Vita (GCC): patched functions are defined both in the recompiled game code and in the patches.
++        // Weak linkage matches the Clang definition above, so the patch (linked first) is the one used.
++        #define RECOMP_FUNC __attribute__((weak, noipa, optimize("rounding-math")))
++    #else
++        #define RECOMP_FUNC __attribute__((noipa, optimize("rounding-math")))
++    #endif
+ 
+     // There's no FENV_ACCESS pragma in gcc, so this can be empty.
+     #define SET_FENV_ACCESS()
+@@ -67,7 +73,42 @@ static inline void DMULTU(uint64_t a, uint64_t b, uint64_t* lo64, uint64_t* hi64
+ }
+ 
+ #else
+-#error "128-bit integer type not found"
++
++// Portable implementation for targets without a 128-bit integer type (e.g. 32-bit ARM / PS Vita).
++static inline void DMULTU(uint64_t a, uint64_t b, uint64_t* lo64, uint64_t* hi64) {
++    uint64_t a_lo = (uint32_t)a;
++    uint64_t a_hi = a >> 32;
++    uint64_t b_lo = (uint32_t)b;
++    uint64_t b_hi = b >> 32;
++
++    uint64_t lo_lo = a_lo * b_lo;
++    uint64_t hi_lo = a_hi * b_lo;
++    uint64_t lo_hi = a_lo * b_hi;
++    uint64_t hi_hi = a_hi * b_hi;
++
++    uint64_t cross = (lo_lo >> 32) + (uint32_t)hi_lo + lo_hi;
++
++    *lo64 = (cross << 32) | (uint32_t)lo_lo;
++    *hi64 = (hi_lo >> 32) + (cross >> 32) + hi_hi;
++}
++
++static inline void DMULT(int64_t a, int64_t b, int64_t* lo64, int64_t* hi64) {
++    uint64_t lo;
++    uint64_t hi;
++    DMULTU((uint64_t)a, (uint64_t)b, &lo, &hi);
++
++    // Convert the unsigned high half to the signed result.
++    if (a < 0) {
++        hi -= (uint64_t)b;
++    }
++    if (b < 0) {
++        hi -= (uint64_t)a;
++    }
++
++    *lo64 = (int64_t)lo;
++    *hi64 = (int64_t)hi;
++}
++
+ #endif
+ 
+ static inline void DDIV(int64_t a, int64_t b, int64_t* quot, int64_t* rem) {

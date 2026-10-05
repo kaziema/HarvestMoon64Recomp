@@ -12,6 +12,12 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# PS Vita build (detected by the VitaSDK compiler). All Vita targets are defined in vita/vita.cmake.
+if (CMAKE_C_COMPILER MATCHES "arm-vita-eabi")
+    include(${CMAKE_SOURCE_DIR}/vita/vita.cmake)
+    return()
+endif()
+
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-everything /W4")
 endif()
