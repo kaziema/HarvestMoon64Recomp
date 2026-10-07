@@ -4,6 +4,8 @@
 # To update a patch after editing files in a submodule:
 #   git -C lib/N64ModernRuntime diff --ignore-submodules > vita/patches/N64ModernRuntime.patch
 #   git -C lib/N64ModernRuntime/N64Recomp diff > vita/patches/N64Recomp.patch
+# Regenerate the patch before configuring again, or configure will try to apply the old patch on top.
+# RT64's Vita changes live in the rt64-gxm repo, not in a patch here.
 
 find_program(HM64_PATCH_TOOL patch REQUIRED)
 

@@ -35,6 +35,15 @@ set(FMT_OS OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime)
 
+# Phase 0 step 2: run RT64's front end on a null Plume backend. OFF uses the null renderer (display lists dropped).
+option(HM64_VITA_RT64 "Run RT64 on the null Plume backend instead of the null renderer" ON)
+if (HM64_VITA_RT64)
+    # VV core (libvv): the GXM layer rt64-gxm draws through.
+    set(HM64_LIBVV_DIR "${CMAKE_SOURCE_DIR}/../libvv" CACHE PATH "The libvv repo (VV core)")
+    add_subdirectory(${HM64_LIBVV_DIR}/core ${CMAKE_BINARY_DIR}/libvv_core)
+    include(${CMAKE_SOURCE_DIR}/vita/rt64.cmake)
+endif()
+
 # The mod live recompiler (sljit) allocates executable memory with mmap, which the Vita does not have.
 # Mods are not supported on the Vita, so its executable allocator is replaced with one that always fails.
 # The settings live in vita/sljit/sljitConfigPre.h, which sljit includes when SLJIT_HAVE_CONFIG_PRE is set.
@@ -127,13 +136,28 @@ add_custom_command(OUTPUT
                    DEPENDS ${CMAKE_SOURCE_DIR}/patches/patches.elf
 )
 
+# Build stamp, rewritten on every build so the boot log always identifies the exact binary.
+set(HM64_BUILD_STAMP_C ${CMAKE_BINARY_DIR}/build_stamp.c)
+add_custom_target(HM64BuildStamp
+    COMMAND ${CMAKE_COMMAND} -DOUT=${HM64_BUILD_STAMP_C} -DSOURCE_DIR=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/vita/build_stamp.cmake
+    BYPRODUCTS ${HM64_BUILD_STAMP_C}
+    COMMENT "Writing build stamp"
+)
+
 # Main executable.
 add_executable(HarvestMoon64Vita)
+add_dependencies(HarvestMoon64Vita HM64BuildStamp)
 
 target_sources(HarvestMoon64Vita PRIVATE
     ${CMAKE_SOURCE_DIR}/src/vita/main_vita.cpp
     ${CMAKE_SOURCE_DIR}/src/vita/null_renderer.cpp
     ${CMAKE_SOURCE_DIR}/src/vita/vita_api.cpp
+    ${CMAKE_SOURCE_DIR}/src/vita/vita_log.cpp
+    ${CMAKE_SOURCE_DIR}/src/vita/vita_selftest.cpp
+    ${CMAKE_SOURCE_DIR}/src/vita/vita_stats.cpp
+    ${CMAKE_SOURCE_DIR}/src/vita/vita_audio.cpp
+    ${CMAKE_SOURCE_DIR}/src/vita/vita_timeline.cpp
+    ${HM64_BUILD_STAMP_C}
 
     ${CMAKE_SOURCE_DIR}/src/main/register_overlays.cpp
     ${CMAKE_SOURCE_DIR}/src/main/register_patches.cpp
@@ -144,6 +168,19 @@ target_sources(HarvestMoon64Vita PRIVATE
 
     ${CMAKE_SOURCE_DIR}/rsp/n_aspMain.cpp
 )
+
+if (HM64_VITA_RT64)
+    target_sources(HarvestMoon64Vita PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/vita/plume_null.cpp
+        ${CMAKE_SOURCE_DIR}/src/vita/vita_rt64_context.cpp
+        ${CMAKE_SOURCE_DIR}/src/vita/vita_rt64_compat.cpp
+        ${CMAKE_SOURCE_DIR}/src/vita/vita_rt64_stubs.cpp
+        ${CMAKE_SOURCE_DIR}/src/vita/rt64_vita_profile.cpp
+    )
+    target_include_directories(HarvestMoon64Vita PRIVATE ${CMAKE_SOURCE_DIR}/vita/rt64)
+    target_compile_definitions(HarvestMoon64Vita PRIVATE HM64_VITA_RT64)
+    target_link_libraries(HarvestMoon64Vita PRIVATE rt64)
+endif()
 
 target_include_directories(HarvestMoon64Vita PRIVATE
     ${CMAKE_SOURCE_DIR}/include
@@ -161,6 +198,36 @@ target_link_libraries(HarvestMoon64Vita PRIVATE
     librecomp
     ultramodern
     pthread
+    SceIofilemgr_stub
+    SceKernelThreadMgr_stub
+    SceSysmem_stub
+    SceLibKernel_stub
+    ScePower_stub
+    SceCtrl_stub
+    SceAudio_stub
+)
+
+# libstdc++ references its pthread functions weakly. When nothing else pulls one in from libpthread it stays
+# undefined, and the ARM linker turns calls to it into no-ops. -u forces each one to be linked.
+#   pthread_cancel: libstdc++ only allows std::thread when it resolves (TEST 1 crash: every std::thread threw).
+#   pthread_once: creates the mutex that guards function-local statics (TEST 3 crash: the call was a no-op,
+#     so __cxa_guard_acquire locked a null mutex).
+#   pthread_cond_wait/broadcast/destroy: used by the same static guard when two threads initialize at once.
+# --wrap=pthread_create routes every thread creation through the logging wrapper in vita_log.cpp.
+target_link_options(HarvestMoon64Vita PRIVATE
+    -Wl,-u,pthread_cancel
+    -Wl,-u,pthread_once
+    -Wl,-u,pthread_cond_wait
+    -Wl,-u,pthread_cond_broadcast
+    -Wl,-u,pthread_cond_destroy
+    -Wl,--wrap=pthread_create
+)
+
+# Fails the build if any pthread or sched function is still an undefined weak symbol, so this class of bug
+# shows up at build time instead of as a crash on hardware.
+add_custom_command(TARGET HarvestMoon64Vita POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -DNM=${CMAKE_NM} -DELF=$<TARGET_FILE:HarvestMoon64Vita> -P ${CMAKE_SOURCE_DIR}/vita/check_weak_symbols.cmake
+    VERBATIM
 )
 
 # Linker map, used to check that patched functions override the original recompiled ones.

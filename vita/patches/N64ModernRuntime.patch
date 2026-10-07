@@ -147,28 +147,179 @@ index 1200f77..9a4a823 100644
  #else
      // munmap returns -1 on failure.
      free_failed = (munmap(rdram, allocation_size) == -1);
+diff --git a/thirdparty/concurrentqueue/blockingconcurrentqueue.h b/thirdparty/concurrentqueue/blockingconcurrentqueue.h
+index 205a4db..bcaf6dc 100644
+--- a/thirdparty/concurrentqueue/blockingconcurrentqueue.h
++++ b/thirdparty/concurrentqueue/blockingconcurrentqueue.h
+@@ -18,6 +18,17 @@
+ 
+ namespace moodycamel
+ {
++#if defined(__vita__)
++// Vita diagnostics (TEST 5 hang): the game's main thread was found spinning in the try_dequeue loop below, which
++// only happens if the semaphore reported an item that the queue does not have. Read by the port's stats log.
++inline std::atomic<std::uint32_t> vita_dequeue_retries{0};      // failed try_dequeue calls after a successful wait
++inline std::atomic<std::uint32_t> vita_dequeue_retry_loops{0};  // waits that needed at least one retry
++#define MOODYCAMEL_VITA_DEQUEUE_AFTER_WAIT(item) \
++	if (!inner.try_dequeue(item)) { \
++		vita_dequeue_retry_loops++; \
++		do { vita_dequeue_retries++; } while (!inner.try_dequeue(item)); \
++	}
++#endif
+ // This is a blocking version of the queue. It has an almost identical interface to
+ // the normal non-blocking version, with the addition of various wait_dequeue() methods
+ // and the removal of producer-specific dequeue methods.
+@@ -361,9 +372,13 @@ public:
+ 		while (!sema->wait()) {
+ 			continue;
+ 		}
++#if defined(__vita__)
++		MOODYCAMEL_VITA_DEQUEUE_AFTER_WAIT(item)
++#else
+ 		while (!inner.try_dequeue(item)) {
+ 			continue;
+ 		}
++#endif
+ 	}
+ 
+ 	// Blocks the current thread until either there's something to dequeue
+@@ -379,9 +394,13 @@ public:
+ 		if (!sema->wait(timeout_usecs)) {
+ 			return false;
+ 		}
++#if defined(__vita__)
++		MOODYCAMEL_VITA_DEQUEUE_AFTER_WAIT(item)
++#else
+ 		while (!inner.try_dequeue(item)) {
+ 			continue;
+ 		}
++#endif
+ 		return true;
+ 	}
+     
 diff --git a/thirdparty/concurrentqueue/lightweightsemaphore.h b/thirdparty/concurrentqueue/lightweightsemaphore.h
-index 41ba094..e79968e 100644
+index 41ba094..445eff1 100644
 --- a/thirdparty/concurrentqueue/lightweightsemaphore.h
 +++ b/thirdparty/concurrentqueue/lightweightsemaphore.h
-@@ -24,7 +24,7 @@ extern "C" {
+@@ -24,6 +24,11 @@ extern "C" {
  }
  #elif defined(__MACH__)
  #include <mach/mach.h>
--#elif defined(__unix__)
-+#elif defined(__unix__) || defined(__vita__)
++#elif defined(__vita__)
++#include <cassert>
++#include <cstdint>
++#include <psp2/kernel/error.h>
++#include <psp2/kernel/threadmgr.h>
+ #elif defined(__unix__)
  #include <semaphore.h>
  
- #if defined(__GLIBC_PREREQ) && defined(_GNU_SOURCE)
-@@ -165,7 +165,7 @@ public:
+@@ -165,6 +170,106 @@ public:
  		}
  	}
  };
--#elif defined(__unix__)
-+#elif defined(__unix__) || defined(__vita__)
++#elif defined(__vita__)
++//---------------------------------------------------------
++// Semaphore (PS Vita kernel)
++//---------------------------------------------------------
++// The VitaSDK POSIX semaphores (pthread-embedded) keep their own counter on top of a kernel semaphore and
++// poll it every 500 us. In TEST 6 the counts drifted ahead of the real signals: the gfx thread's queue
++// semaphore reported items the queue did not have, and N64 threads woke without being resumed. The kernel's
++// own counting semaphore is used directly instead.
++
++// Vita diagnostics, read by the port's stats log: failures of the kernel semaphore calls and their error codes.
++struct VitaSemaStats {
++	std::atomic<std::uint32_t> init_failures{0};
++	std::atomic<int> init_last_error{0};
++	std::atomic<std::uint32_t> wait_failures{0};      // sceKernelWaitSema failed (not a timeout)
++	std::atomic<int> wait_last_error{0};
++	std::atomic<std::uint32_t> post_failures{0};      // sceKernelSignalSema failed
++	std::atomic<int> post_last_error{0};
++	std::atomic<std::uint32_t> created{0};
++};
++inline VitaSemaStats vita_sema_stats;
++
++class Semaphore
++{
++private:
++	SceUID m_sema;
++
++	Semaphore(const Semaphore& other) MOODYCAMEL_DELETE_FUNCTION;
++	Semaphore& operator=(const Semaphore& other) MOODYCAMEL_DELETE_FUNCTION;
++
++	void record_wait_failure(int rc)
++	{
++		vita_sema_stats.wait_last_error = rc;
++		vita_sema_stats.wait_failures++;
++	}
++
++public:
++	Semaphore(int initialCount = 0)
++	{
++		assert(initialCount >= 0);
++		m_sema = sceKernelCreateSema("moodycamel", SCE_KERNEL_ATTR_THREAD_PRIO, initialCount, 0x7FFFFFFF, nullptr);
++		if (m_sema < 0) {
++			vita_sema_stats.init_last_error = m_sema;
++			vita_sema_stats.init_failures++;
++		}
++		else {
++			vita_sema_stats.created++;
++		}
++	}
++
++	~Semaphore()
++	{
++		if (m_sema >= 0) {
++			sceKernelDeleteSema(m_sema);
++		}
++	}
++
++	bool wait()
++	{
++		int rc = sceKernelWaitSema(m_sema, 1, nullptr);
++		if (rc < 0) {
++			record_wait_failure(rc);
++		}
++		return rc >= 0;
++	}
++
++	bool try_wait()
++	{
++		return sceKernelPollSema(m_sema, 1) >= 0;
++	}
++
++	bool timed_wait(std::uint64_t usecs)
++	{
++		SceUInt timeout = usecs > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<SceUInt>(usecs);
++		int rc = sceKernelWaitSema(m_sema, 1, &timeout);
++		if (rc < 0 && rc != (int)SCE_KERNEL_ERROR_WAIT_TIMEOUT) {
++			record_wait_failure(rc);
++		}
++		return rc >= 0;
++	}
++
++	void signal()
++	{
++		int rc = sceKernelSignalSema(m_sema, 1);
++		if (rc < 0) {
++			vita_sema_stats.post_last_error = rc;
++			vita_sema_stats.post_failures++;
++		}
++	}
++
++	void signal(int count)
++	{
++		if (count > 0) {
++			int rc = sceKernelSignalSema(m_sema, count);
++			if (rc < 0) {
++				vita_sema_stats.post_last_error = rc;
++				vita_sema_stats.post_failures++;
++			}
++		}
++	}
++};
+ #elif defined(__unix__)
  //---------------------------------------------------------
  // Semaphore (POSIX, Linux)
- //---------------------------------------------------------
 diff --git a/ultramodern/include/ultramodern/renderer_context.hpp b/ultramodern/include/ultramodern/renderer_context.hpp
 index d60c4ec..1e86acc 100644
 --- a/ultramodern/include/ultramodern/renderer_context.hpp
@@ -186,6 +337,35 @@ index d60c4ec..1e86acc 100644
  #endif
  
          enum class SetupResult {
+diff --git a/ultramodern/include/ultramodern/ultramodern.hpp b/ultramodern/include/ultramodern/ultramodern.hpp
+index 3b28af3..b35a8fc 100644
+--- a/ultramodern/include/ultramodern/ultramodern.hpp
++++ b/ultramodern/include/ultramodern/ultramodern.hpp
+@@ -150,6 +150,24 @@ void set_callbacks(
+ );
+ } // namespace ultramodern
+ 
++#ifdef __vita__
++// Vita diagnostics, read by the port's stats log and hang watchdog.
++// Idle stats: total time the game spent waiting for an external message with no game thread runnable
++// (the game's idle thread calls pause_self/yield_self), how many times it waited, and when the wait in
++// progress started (process time in us, 0 if not waiting). Completed waits are only added when they end.
++extern "C" void ultramodern_vita_idle_stats(uint64_t* wait_us, uint32_t* wait_count, uint64_t* current_wait_start_us);
++// Scheduler stats: the N64 thread that resumed most recently, when it resumed (process time in us),
++// and how many times any game thread has resumed.
++extern "C" void ultramodern_vita_sched_stats(int32_t* last_thread_id, uint64_t* last_resume_us, uint32_t* resume_count);
++// Times a game thread's resume wait failed (it waits again instead of running without being resumed).
++extern "C" uint32_t ultramodern_vita_resume_wait_failures();
++// Signals of game threads' running semaphores, and wakes from them. More wakes than signals = spurious wakes.
++extern "C" void ultramodern_vita_running_stats(uint32_t* signals, uint32_t* wakes);
++// 1 ms timed waits (yield_self_1ms, and the gfx thread's action queue) and how many returned in under 0.9 ms.
++extern "C" void ultramodern_vita_timed_wait_stats(uint32_t* waits, uint32_t* early_timeouts);
++extern "C" void ultramodern_vita_gfx_wait_stats(uint32_t* waits, uint32_t* early_timeouts);
++#endif
++
+ #define MIN(a, b) ((a) < (b) ? (a) : (b))
+ 
+ #define debug_printf(...)
 diff --git a/ultramodern/src/error_handling.cpp b/ultramodern/src/error_handling.cpp
 index 8ca779e..1e250b8 100644
 --- a/ultramodern/src/error_handling.cpp
@@ -199,19 +379,256 @@ index 8ca779e..1e250b8 100644
      std::_Exit(exit_status);
  #else
      std::quick_exit(exit_status);
-diff --git a/ultramodern/src/threads.cpp b/ultramodern/src/threads.cpp
-index 812c556..333c322 100644
---- a/ultramodern/src/threads.cpp
-+++ b/ultramodern/src/threads.cpp
-@@ -143,6 +143,11 @@ void ultramodern::set_native_thread_name(const std::string& name) {
-     pthread_setname_np(name.c_str());
+diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
+index 090cc42..baf3aec 100644
+--- a/ultramodern/src/events.cpp
++++ b/ultramodern/src/events.cpp
+@@ -267,6 +267,19 @@ void dp_complete() {
+     ultramodern::enqueue_external_message(events_context.dp.mq, events_context.dp.msg, false, true);
  }
  
-+void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
-+#elif defined(__vita__)
-+// Vita threads are named at creation and std::thread offers no way to rename them afterwards.
-+void ultramodern::set_native_thread_name(const std::string& name) {}
++#ifdef __vita__
++#include <psp2/kernel/processmgr.h>
 +
++// The gfx thread's 1 ms action queue waits, and how many timed out in under 900 us (TEST 5: it used 95% of a core).
++static std::atomic<uint32_t> vita_gfx_waits{0};
++static std::atomic<uint32_t> vita_gfx_wait_early{0};
++
++extern "C" void ultramodern_vita_gfx_wait_stats(uint32_t* waits, uint32_t* early_timeouts) {
++    *waits = vita_gfx_waits.load();
++    *early_timeouts = vita_gfx_wait_early.load();
++}
++#endif
++
+ void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_ready) {
+     ultramodern::set_native_thread_name("SP Task Thread");
+     ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::Normal);
+@@ -356,7 +369,17 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+     while (!exited) {
+         // Try to pull an action from the queue
+         Action action;
++#ifdef __vita__
++        const uint64_t vita_wait_start = sceKernelGetProcessTimeWide();
++        const bool vita_dequeued = events_context.action_queue.wait_dequeue_timed(action, 1ms);
++        vita_gfx_waits++;
++        if (!vita_dequeued && sceKernelGetProcessTimeWide() - vita_wait_start < 900) {
++            vita_gfx_wait_early++;
++        }
++        if (vita_dequeued) {
++#else
+         if (events_context.action_queue.wait_dequeue_timed(action, 1ms)) {
++#endif
+             // Determine the action type and act on it
+             if (const auto* task_action = std::get_if<SpTaskAction>(&action)) {
+                 // Tell the game that the RSP completed instantly. This will allow it to queue other task types, but it won't
+diff --git a/ultramodern/src/mesgqueue.cpp b/ultramodern/src/mesgqueue.cpp
+index 961de3d..0c10e34 100644
+--- a/ultramodern/src/mesgqueue.cpp
++++ b/ultramodern/src/mesgqueue.cpp
+@@ -33,9 +33,54 @@ void dequeue_external_messages(RDRAM_ARG1) {
+     }
+ }
+ 
++#ifdef __vita__
++#include <atomic>
++#include <psp2/kernel/processmgr.h>
++
++// Only the game's idle thread waits here (through pause_self/yield_self), and only while no other game
++// thread can run, so the total wait time is the time the game's CPU work was idle.
++static std::atomic<uint64_t> vita_idle_wait_us{0};
++static std::atomic<uint32_t> vita_idle_wait_count{0};
++static std::atomic<uint64_t> vita_idle_wait_start_us{0}; // 0 when not waiting
++
++struct VitaIdleTimer {
++    uint64_t start = sceKernelGetProcessTimeWide();
++    VitaIdleTimer() {
++        vita_idle_wait_start_us = start;
++    }
++    ~VitaIdleTimer() {
++        uint64_t end = sceKernelGetProcessTimeWide();
++        vita_idle_wait_start_us = 0;
++        vita_idle_wait_us += end - start;
++        vita_idle_wait_count++;
++    }
++};
++
++// 1 ms timed waits (yield_self_1ms) and how many of them timed out in under 900 us, i.e. did not really wait.
++static std::atomic<uint32_t> vita_timed_waits{0};
++static std::atomic<uint32_t> vita_timed_wait_early{0};
++
++extern "C" void ultramodern_vita_timed_wait_stats(uint32_t* waits, uint32_t* early_timeouts) {
++    *waits = vita_timed_waits.load();
++    *early_timeouts = vita_timed_wait_early.load();
++}
++
++extern "C" void ultramodern_vita_idle_stats(uint64_t* wait_us, uint32_t* wait_count, uint64_t* current_wait_start_us) {
++    // Totals first: a wait that ends between the two reads is then missed for one sample instead of counted twice.
++    *wait_us = vita_idle_wait_us.load();
++    *wait_count = vita_idle_wait_count.load();
++    *current_wait_start_us = vita_idle_wait_start_us.load();
++}
++#endif
++
+ void ultramodern::wait_for_external_message(RDRAM_ARG1) {
+     QueuedMessage to_send;
+-    external_messages.wait_dequeue(to_send);
++    {
++#ifdef __vita__
++        VitaIdleTimer idle_timer;
++#endif
++        external_messages.wait_dequeue(to_send);
++    }
+     if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
+         external_messages.enqueue(to_send);
+     }
+@@ -43,7 +88,20 @@ void ultramodern::wait_for_external_message(RDRAM_ARG1) {
+ 
+ void ultramodern::wait_for_external_message_timed(RDRAM_ARG u32 millis) {
+     QueuedMessage to_send;
+-    if (external_messages.wait_dequeue_timed(to_send, std::chrono::milliseconds{millis})) {
++    bool dequeued;
++    {
++#ifdef __vita__
++        VitaIdleTimer idle_timer;
++#endif
++        dequeued = external_messages.wait_dequeue_timed(to_send, std::chrono::milliseconds{millis});
++#ifdef __vita__
++        vita_timed_waits++;
++        if (!dequeued && sceKernelGetProcessTimeWide() - idle_timer.start < (uint64_t)millis * 900) {
++            vita_timed_wait_early++;
++        }
++#endif
++    }
++    if (dequeued) {
+         if (!do_send(PASS_RDRAM to_send.mq, to_send.mesg, to_send.jam, false) && to_send.requeue_if_blocked) {
+             external_messages.enqueue(to_send);
+         }
+diff --git a/ultramodern/src/threads.cpp b/ultramodern/src/threads.cpp
+index 812c556..5d7dd46 100644
+--- a/ultramodern/src/threads.cpp
++++ b/ultramodern/src/threads.cpp
+@@ -144,10 +144,100 @@ void ultramodern::set_native_thread_name(const std::string& name) {
+ }
+ 
  void ultramodern::set_native_thread_priority(ThreadPriority pri) {}
++#elif defined(__vita__)
++#include <psp2/kernel/threadmgr.h>
++
++// Vita threads are named at creation and std::thread offers no way to rename them afterwards, so the name is
++// passed to the port instead (it tags the thread in its diagnostics log), if the port defines this hook.
++extern "C" void ultramodern_vita_thread_named(const char* name) __attribute__((weak));
++
++void ultramodern::set_native_thread_name(const std::string& name) {
++    if (ultramodern_vita_thread_named != nullptr) {
++        ultramodern_vita_thread_named(name.c_str());
++    }
++}
++
++// The Vita does not time-slice threads of equal priority: a thread that never blocks keeps its core, and
++// threads of the same priority waiting to run on it never do. Every pthread starts at the lowest user
++// priority (191), so in TEST 5 three busy threads held all three cores and the VI thread never ran again.
++// These map the levels ultramodern already asks for onto real Vita priorities (64 highest, 191 lowest).
++void ultramodern::set_native_thread_priority(ThreadPriority pri) {
++    int vita_priority;
++    switch (pri) {
++        case ThreadPriority::Critical:
++            vita_priority = 72;
++            break;
++        case ThreadPriority::VeryHigh:
++            vita_priority = 80;
++            break;
++        case ThreadPriority::High:
++            vita_priority = 112;
++            break;
++        case ThreadPriority::Normal:
++            vita_priority = 128;
++            break;
++        case ThreadPriority::Low:
++        default:
++            vita_priority = 150;
++            break;
++    }
++    sceKernelChangeThreadPriority(0, vita_priority);
++}
++#endif
++
++#ifdef __vita__
++#include <atomic>
++#include <psp2/kernel/processmgr.h>
++
++// Which N64 thread resumed last and when. If the game hangs, this names the thread that was running.
++static std::atomic<int32_t> vita_last_thread_id{-1};
++static std::atomic<uint64_t> vita_last_resume_us{0};
++static std::atomic<uint32_t> vita_resume_count{0};
++// Times running.wait() returned false, i.e. the semaphore wait failed and the thread was not actually resumed.
++static std::atomic<uint32_t> vita_resume_wait_failures{0};
++
++extern "C" uint32_t ultramodern_vita_resume_wait_failures() {
++    return vita_resume_wait_failures.load();
++}
++
++// Every signal of a thread's running semaphore, and every wake from it. A thread can only wake after a signal,
++// so more wakes than signals means a semaphore returned without being signaled (TEST 6 hypothesis).
++static std::atomic<uint32_t> vita_running_signals{0};
++static std::atomic<uint32_t> vita_running_wakes{0};
++
++extern "C" void ultramodern_vita_running_stats(uint32_t* signals, uint32_t* wakes) {
++    // Wakes first: a signal and wake landing between the two reads then cannot make wakes look ahead.
++    *wakes = vita_running_wakes.load();
++    *signals = vita_running_signals.load();
++}
++
++extern "C" void ultramodern_vita_sched_stats(int32_t* last_thread_id, uint64_t* last_resume_us, uint32_t* resume_count) {
++    *last_thread_id = vita_last_thread_id.load();
++    *last_resume_us = vita_last_resume_us.load();
++    *resume_count = vita_resume_count.load();
++}
++
++#define VITA_COUNT_RUNNING_SIGNAL() vita_running_signals++
++#else
++#define VITA_COUNT_RUNNING_SIGNAL()
  #endif
  
+ void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
++#ifdef __vita__
++    // The original ignores the result. If the wait fails, the thread was not resumed, but it would carry on running
++    // game code alongside the thread that was (TEST 5: the game's idle thread ran while the main thread held the CPU).
++    while (!thread_context->running.wait()) {
++        vita_resume_wait_failures++;
++    }
++    vita_running_wakes++;
++#else
+     thread_context->running.wait();
++#endif
++#ifdef __vita__
++    vita_last_thread_id = TO_PTR(OSThread, ultramodern::this_thread())->id;
++    vita_last_resume_us = sceKernelGetProcessTimeWide();
++    vita_resume_count++;
++#endif
+     // If this thread's context was replaced by another thread or deleted, destroy it again from its own context.
+     // This will trigger thread cleanup instead.
+     if (TO_PTR(OSThread, ultramodern::this_thread())->context != thread_context) {
+@@ -157,6 +247,7 @@ void wait_for_resumed(RDRAM_ARG UltraThreadContext* thread_context) {
+ 
+ void resume_thread(OSThread* t) {
+     debug_printf("[Thread] Resuming execution of thread %d\n", t->id);
++    VITA_COUNT_RUNNING_SIGNAL();
+     t->context->running.signal();
+ }
+ 
+@@ -167,6 +258,7 @@ void run_next_thread(RDRAM_ARG1) {
+ 
+     OSThread* to_run = TO_PTR(OSThread, ultramodern::thread_queue_pop(PASS_RDRAM ultramodern::running_queue));
+     debug_printf("[Scheduling] Resuming execution of thread %d\n", to_run->id);
++    VITA_COUNT_RUNNING_SIGNAL();
+     to_run->context->running.signal();
+ }
+ 
+@@ -297,6 +389,7 @@ extern "C" void osDestroyThread(RDRAM_ARG PTR(OSThread) t_) {
+     if (cur_context != nullptr) {
+         // Mark the target thread as destroyed and resume it. When it starts it'll check this and terminate itself instead of resuming.
+         t->context = nullptr;
++        VITA_COUNT_RUNNING_SIGNAL();
+         cur_context->running.signal();
+     }
+ }
