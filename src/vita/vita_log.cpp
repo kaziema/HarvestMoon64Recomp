@@ -18,7 +18,7 @@
 #include <psp2/kernel/threadmgr.h>
 
 static const char* const LogDir = "ux0:data/hm64";
-static const char* const LogPath = "ux0:data/hm64/phase0.log";
+static const char* const LogPath = "ux0:data/hm64/hm64.log";
 
 // Kernel lightweight mutex, so logging works even if pthreads are broken (one of the hypotheses).
 static SceKernelLwMutexWork log_mutex;
@@ -37,7 +37,7 @@ void hm64vita::log_line(const char* fmt, ...) {
         return;
     }
 
-    char line[512];
+    char line[2048];
     const unsigned long long ms = sceKernelGetProcessTimeWide() / 1000ULL;
     int prefix = snprintf(line, sizeof(line), "[%8llu ms] [th 0x%08X] ", ms, (unsigned int)sceKernelGetThreadId());
     if (prefix < 0) {
@@ -187,4 +187,19 @@ extern "C" int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* at
         hm64vita::log_memory("pthread_create failed");
     }
     return result;
+}
+
+// The runtime's Vita diagnostics (N64ModernRuntime patch: save file handling in pi.cpp) log through this.
+extern "C" void ultramodern_vita_log(const char* message) {
+    hm64vita::log_line("%s", message);
+}
+
+bool hm64vita::diagnostics() {
+    static int state = -1;
+    if (state < 0) {
+        SceIoStat stat;
+        state = (sceIoGetstat("ux0:data/hm64/diagnostics.txt", &stat) >= 0) ? 1 : 0;
+        log_line("diagnostics %s (ux0:data/hm64/diagnostics.txt %s)", state ? "ON" : "off", state ? "present" : "absent");
+    }
+    return state == 1;
 }

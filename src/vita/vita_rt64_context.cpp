@@ -82,6 +82,7 @@ namespace {
             hm64vita::log_memory("after VV core init");
             if (vv_ready) {
                 const bool renderer_ready = rt64gxm::renderer_init([](const char* message) { hm64vita::log_line("%s", message); });
+                rt64gxm::set_diagnostics(hm64vita::diagnostics());
                 hm64vita::log_line("rt64-gxm renderer init: %s", renderer_ready ? "ok" : "FAILED");
             }
 

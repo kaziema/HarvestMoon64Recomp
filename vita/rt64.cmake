@@ -56,7 +56,7 @@ set_target_properties(rt64_respirv PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUI
 add_library(rt64 STATIC ${RT64_VITA_SOURCES} ${RT64_SHADER_BLOB_SOURCES})
 
 # rt64-gxm: RT64's GPU half for the Vita, drawing the recorded frames through VV core (libvv).
-target_sources(rt64 PRIVATE ${RT64_DIR}/src/gxm/rt64_gxm_renderer.cpp ${RT64_DIR}/src/gxm/rt64_gxm_textures.cpp)
+target_sources(rt64 PRIVATE ${RT64_DIR}/src/gxm/rt64_gxm_renderer.cpp ${RT64_DIR}/src/gxm/rt64_gxm_textures.cpp ${RT64_DIR}/src/gxm/rt64_gxm_combiner.cpp)
 target_compile_definitions(rt64 PUBLIC RT64_GXM)
 target_link_libraries(rt64 PUBLIC vv_core)
 

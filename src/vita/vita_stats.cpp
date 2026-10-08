@@ -188,95 +188,99 @@ namespace {
                     (unsigned int)((busy_us * 100) / (wall_us ? wall_us : 1)), (unsigned int)(idle_delta / 1000), (unsigned int)wait_delta);
             }
 
-            hm64vita::log_line("second %u: display lists %u (+%u), screen updates %u (+%u), VIs +%u, main loop +%u | game busy %s, thread resumes +%u | audio tasks +%u, %u ms total, max %u us",
-                (unsigned int)seconds, (unsigned int)dl, (unsigned int)(dl - last_dl), (unsigned int)scr, (unsigned int)(scr - last_scr),
-                (unsigned int)(vi - last_vi), (unsigned int)(loop - last_loop), busy, (unsigned int)(resumes - last_resumes),
-                (unsigned int)(audio_count - last_audio_count), (unsigned int)((audio_us - last_audio_us) / 1000), (unsigned int)audio_max_us);
+            // Per-second statistics only with diagnostics on (ux0:data/hm64/diagnostics.txt): each log line is a
+            // memory-card write, and these made the game lag (tests 22 and 23).
+            if (hm64vita::diagnostics()) {
+                hm64vita::log_line("second %u: display lists %u (+%u), screen updates %u (+%u), VIs +%u, main loop +%u | game busy %s, thread resumes +%u | audio tasks +%u, %u ms total, max %u us",
+                    (unsigned int)seconds, (unsigned int)dl, (unsigned int)(dl - last_dl), (unsigned int)scr, (unsigned int)(scr - last_scr),
+                    (unsigned int)(vi - last_vi), (unsigned int)(loop - last_loop), busy, (unsigned int)(resumes - last_resumes),
+                    (unsigned int)(audio_count - last_audio_count), (unsigned int)((audio_us - last_audio_us) / 1000), (unsigned int)audio_max_us);
 
-            // TEST 5 hang hypotheses: 1 ms waits that do not really wait (busy threads), the queue semaphore reporting
-            // items the queue does not have (try_dequeue spin), resume waits failing (two game threads running at
-            // once), and POSIX semaphore calls failing.
-            uint32_t yield_waits = 0, yield_early = 0, gfx_waits = 0, gfx_early = 0;
-            ultramodern_vita_timed_wait_stats(&yield_waits, &yield_early);
-            ultramodern_vita_gfx_wait_stats(&gfx_waits, &gfx_early);
-            const uint32_t retries = moodycamel::vita_dequeue_retries.load();
-            const uint32_t retry_loops = moodycamel::vita_dequeue_retry_loops.load();
-            const uint32_t resume_failures = ultramodern_vita_resume_wait_failures();
-            auto& sema = moodycamel::details::vita_sema_stats;
-            uint32_t running_signals = 0, running_wakes = 0;
-            ultramodern_vita_running_stats(&running_signals, &running_wakes);
-            hm64vita::log_line("waits second %u: yield 1ms +%u (early +%u), gfx 1ms +%u (early +%u), dequeue retries +%u (loops +%u), resume wait failures +%u | thread resumes signaled %u, woken %u (woken above signaled = woke without a resume) | kernel semas %u, failures: create %u (0x%08X), wait %u (0x%08X), signal %u (0x%08X)",
-                (unsigned int)seconds, (unsigned int)(yield_waits - last_yield_waits), (unsigned int)(yield_early - last_yield_early),
-                (unsigned int)(gfx_waits - last_gfx_waits), (unsigned int)(gfx_early - last_gfx_early),
-                (unsigned int)(retries - last_retries), (unsigned int)(retry_loops - last_retry_loops),
-                (unsigned int)(resume_failures - last_resume_failures),
-                (unsigned int)running_signals, (unsigned int)running_wakes,
-                (unsigned int)sema.created.load(),
-                (unsigned int)sema.init_failures.load(), (unsigned int)sema.init_last_error.load(),
-                (unsigned int)sema.wait_failures.load(), (unsigned int)sema.wait_last_error.load(),
-                (unsigned int)sema.post_failures.load(), (unsigned int)sema.post_last_error.load());
-            last_yield_waits = yield_waits;
-            last_yield_early = yield_early;
-            last_gfx_waits = gfx_waits;
-            last_gfx_early = gfx_early;
-            last_retries = retries;
-            last_retry_loops = retry_loops;
-            last_resume_failures = resume_failures;
+                // TEST 5 hang hypotheses: 1 ms waits that do not really wait (busy threads), the queue semaphore reporting
+                // items the queue does not have (try_dequeue spin), resume waits failing (two game threads running at
+                // once), and POSIX semaphore calls failing.
+                uint32_t yield_waits = 0, yield_early = 0, gfx_waits = 0, gfx_early = 0;
+                ultramodern_vita_timed_wait_stats(&yield_waits, &yield_early);
+                ultramodern_vita_gfx_wait_stats(&gfx_waits, &gfx_early);
+                const uint32_t retries = moodycamel::vita_dequeue_retries.load();
+                const uint32_t retry_loops = moodycamel::vita_dequeue_retry_loops.load();
+                const uint32_t resume_failures = ultramodern_vita_resume_wait_failures();
+                auto& sema = moodycamel::details::vita_sema_stats;
+                uint32_t running_signals = 0, running_wakes = 0;
+                ultramodern_vita_running_stats(&running_signals, &running_wakes);
+                hm64vita::log_line("waits second %u: yield 1ms +%u (early +%u), gfx 1ms +%u (early +%u), dequeue retries +%u (loops +%u), resume wait failures +%u | thread resumes signaled %u, woken %u (woken above signaled = woke without a resume) | kernel semas %u, failures: create %u (0x%08X), wait %u (0x%08X), signal %u (0x%08X)",
+                    (unsigned int)seconds, (unsigned int)(yield_waits - last_yield_waits), (unsigned int)(yield_early - last_yield_early),
+                    (unsigned int)(gfx_waits - last_gfx_waits), (unsigned int)(gfx_early - last_gfx_early),
+                    (unsigned int)(retries - last_retries), (unsigned int)(retry_loops - last_retry_loops),
+                    (unsigned int)(resume_failures - last_resume_failures),
+                    (unsigned int)running_signals, (unsigned int)running_wakes,
+                    (unsigned int)sema.created.load(),
+                    (unsigned int)sema.init_failures.load(), (unsigned int)sema.init_last_error.load(),
+                    (unsigned int)sema.wait_failures.load(), (unsigned int)sema.wait_last_error.load(),
+                    (unsigned int)sema.post_failures.load(), (unsigned int)sema.post_last_error.load());
+                last_yield_waits = yield_waits;
+                last_yield_early = yield_early;
+                last_gfx_waits = gfx_waits;
+                last_gfx_early = gfx_early;
+                last_retries = retries;
+                last_retry_loops = retry_loops;
+                last_resume_failures = resume_failures;
 
-            // Renderer cost (Phase 0 step 2): RT64's front end runs inside send_dl (on the gfx thread) and
-            // update_screen. Its worker threads show up separately in the 5 second thread table.
-            const hm64vita::RendererTimes renderer_times = hm64vita::take_renderer_times();
-            const uint32_t dl_delta = dl - last_dl;
-            const uint64_t dl_us = renderer_times.display_list_us - last_dl_us;
-            const uint64_t screen_us = renderer_times.screen_update_us - last_screen_us;
-            hm64vita::log_line("renderer second %u: send_dl %u ms total (%u us avg, max %u us), update_screen %u ms total (max %u us)",
-                (unsigned int)seconds, (unsigned int)(dl_us / 1000), dl_delta ? (unsigned int)(dl_us / dl_delta) : 0,
-                (unsigned int)renderer_times.display_list_max_us, (unsigned int)(screen_us / 1000), (unsigned int)renderer_times.screen_update_max_us);
-            last_dl_us = renderer_times.display_list_us;
-            last_screen_us = renderer_times.screen_update_us;
-#if defined(HM64_VITA_RT64)
-            const hm64vita::PlumeNullStats plume = hm64vita::get_plume_null_stats();
-            hm64vita::log_line("gpu work second %u (dropped by the null backend): command lists +%u, draws +%u, dispatches +%u, copies +%u, presents +%u | alive: %u buffers, %u textures, %u KB mapped",
-                (unsigned int)seconds, (unsigned int)(plume.command_lists_executed - last_plume.command_lists_executed),
-                (unsigned int)(plume.draws - last_plume.draws), (unsigned int)(plume.dispatches - last_plume.dispatches),
-                (unsigned int)(plume.copies - last_plume.copies), (unsigned int)(plume.presents - last_plume.presents),
-                (unsigned int)plume.buffers_alive, (unsigned int)plume.textures_alive, (unsigned int)(plume.mapped_bytes / 1024));
-            last_plume = plume;
+                // Renderer cost (Phase 0 step 2): RT64's front end runs inside send_dl (on the gfx thread) and
+                // update_screen. Its worker threads show up separately in the 5 second thread table.
+                const hm64vita::RendererTimes renderer_times = hm64vita::take_renderer_times();
+                const uint32_t dl_delta = dl - last_dl;
+                const uint64_t dl_us = renderer_times.display_list_us - last_dl_us;
+                const uint64_t screen_us = renderer_times.screen_update_us - last_screen_us;
+                hm64vita::log_line("renderer second %u: send_dl %u ms total (%u us avg, max %u us), update_screen %u ms total (max %u us)",
+                    (unsigned int)seconds, (unsigned int)(dl_us / 1000), dl_delta ? (unsigned int)(dl_us / dl_delta) : 0,
+                    (unsigned int)renderer_times.display_list_max_us, (unsigned int)(screen_us / 1000), (unsigned int)renderer_times.screen_update_max_us);
+                last_dl_us = renderer_times.display_list_us;
+                last_screen_us = renderer_times.screen_update_us;
+    #if defined(HM64_VITA_RT64)
+                const hm64vita::PlumeNullStats plume = hm64vita::get_plume_null_stats();
+                hm64vita::log_line("gpu work second %u (dropped by the null backend): command lists +%u, draws +%u, dispatches +%u, copies +%u, presents +%u | alive: %u buffers, %u textures, %u KB mapped",
+                    (unsigned int)seconds, (unsigned int)(plume.command_lists_executed - last_plume.command_lists_executed),
+                    (unsigned int)(plume.draws - last_plume.draws), (unsigned int)(plume.dispatches - last_plume.dispatches),
+                    (unsigned int)(plume.copies - last_plume.copies), (unsigned int)(plume.presents - last_plume.presents),
+                    (unsigned int)plume.buffers_alive, (unsigned int)plume.textures_alive, (unsigned int)(plume.mapped_bytes / 1024));
+                last_plume = plume;
 
-            // TEST 9: where RT64's time goes. Zones nest (the fs.* zones are inside fullSync, fs.pairTiles is inside
-            // fs.renderToRAM), so they do not add up. Each timed call also costs two timer reads (see the self-test).
-            uint64_t zone_us[RT64_ZONE_COUNT];
-            uint32_t zone_calls[RT64_ZONE_COUNT];
-            hm64vita::rt64_zone_totals(zone_us, zone_calls);
-            char zone_line[640];
-            int zone_length = snprintf(zone_line, sizeof(zone_line), "rt64 zones second %u (ms/calls):", (unsigned int)seconds);
-            for (int z = 0; z < RT64_ZONE_COUNT && zone_length > 0 && zone_length < (int)sizeof(zone_line); z++) {
-                zone_length += snprintf(zone_line + zone_length, sizeof(zone_line) - zone_length, " %s %u/%u", hm64vita::rt64_zone_name(z),
-                    (unsigned int)((zone_us[z] - last_zone_us[z]) / 1000), (unsigned int)(zone_calls[z] - last_zone_calls[z]));
-                last_zone_us[z] = zone_us[z];
-                last_zone_calls[z] = zone_calls[z];
-            }
-            hm64vita::log_line("%s", zone_line);
-#endif
+                // TEST 9: where RT64's time goes. Zones nest (the fs.* zones are inside fullSync, fs.pairTiles is inside
+                // fs.renderToRAM), so they do not add up. Each timed call also costs two timer reads (see the self-test).
+                uint64_t zone_us[RT64_ZONE_COUNT];
+                uint32_t zone_calls[RT64_ZONE_COUNT];
+                hm64vita::rt64_zone_totals(zone_us, zone_calls);
+                char zone_line[640];
+                int zone_length = snprintf(zone_line, sizeof(zone_line), "rt64 zones second %u (ms/calls):", (unsigned int)seconds);
+                for (int z = 0; z < RT64_ZONE_COUNT && zone_length > 0 && zone_length < (int)sizeof(zone_line); z++) {
+                    zone_length += snprintf(zone_line + zone_length, sizeof(zone_line) - zone_length, " %s %u/%u", hm64vita::rt64_zone_name(z),
+                        (unsigned int)((zone_us[z] - last_zone_us[z]) / 1000), (unsigned int)(zone_calls[z] - last_zone_calls[z]));
+                    last_zone_us[z] = zone_us[z];
+                    last_zone_calls[z] = zone_calls[z];
+                }
+                hm64vita::log_line("%s", zone_line);
+    #endif
 
-            last_dl = dl;
-            last_scr = scr;
-            last_loop = loop;
-            last_vi = vi;
-            last_idle_us = idle_us;
-            last_waits = waits;
-            last_resumes = resumes;
-            last_audio_count = audio_count;
-            last_audio_us = audio_us;
+                last_dl = dl;
+                last_scr = scr;
+                last_loop = loop;
+                last_vi = vi;
+                last_idle_us = idle_us;
+                last_waits = waits;
+                last_resumes = resumes;
+                last_audio_count = audio_count;
+                last_audio_us = audio_us;
 
-            // TEST 11: one two-second frame timeline, 40 seconds in (in game by then in earlier runs).
-            hm64vita::timeline_tick(seconds, 40);
+                // TEST 11: one two-second frame timeline, 40 seconds in (in game by then in earlier runs).
+                hm64vita::timeline_tick(seconds, 40);
 
-            if ((seconds % 5) == 0) {
-                hm64vita::log_memory("running");
-                hm64vita::log_clocks("running");
-                log_thread_table("every 5 s", now - last_table_us);
-                last_table_us = now;
+                if ((seconds % 5) == 0) {
+                    hm64vita::log_memory("running");
+                    hm64vita::log_clocks("running");
+                    log_thread_table("every 5 s", now - last_table_us);
+                    last_table_us = now;
+                }
             }
 
             // Hang watchdog.

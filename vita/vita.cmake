@@ -156,6 +156,12 @@ target_sources(HarvestMoon64Vita PRIVATE
     ${CMAKE_SOURCE_DIR}/src/vita/vita_selftest.cpp
     ${CMAKE_SOURCE_DIR}/src/vita/vita_stats.cpp
     ${CMAKE_SOURCE_DIR}/src/vita/vita_audio.cpp
+    ${CMAKE_SOURCE_DIR}/src/vita/vita_audio_hle.cpp
+    ${CMAKE_SOURCE_DIR}/src/vita/vita_debug_controls.cpp
+    ${CMAKE_SOURCE_DIR}/src/vita/rsp_hle/alist.c
+    ${CMAKE_SOURCE_DIR}/src/vita/rsp_hle/alist_naudio.c
+    ${CMAKE_SOURCE_DIR}/src/vita/rsp_hle/audio.c
+    ${CMAKE_SOURCE_DIR}/src/vita/rsp_hle/memory.c
     ${CMAKE_SOURCE_DIR}/src/vita/vita_timeline.cpp
     ${HM64_BUILD_STAMP_C}
 
@@ -205,6 +211,7 @@ target_link_libraries(HarvestMoon64Vita PRIVATE
     ScePower_stub
     SceCtrl_stub
     SceAudio_stub
+    SceTouch_stub
 )
 
 # libstdc++ references its pthread functions weakly. When nothing else pulls one in from libpthread it stays

@@ -112,6 +112,167 @@ index 0f7de83..747432e 100644
  #else
  #   error "Unsupported architecture"
  #endif
+diff --git a/librecomp/src/pi.cpp b/librecomp/src/pi.cpp
+index 62656ad..509a1e4 100644
+--- a/librecomp/src/pi.cpp
++++ b/librecomp/src/pi.cpp
+@@ -11,6 +11,34 @@
+ #include <ultramodern/ultra64.h>
+ #include <ultramodern/ultramodern.hpp>
+ 
++#ifdef __vita__
++#include <cstdarg>
++#include <cstdio>
++#include <atomic>
++#include <psp2/io/fcntl.h>
++#include <psp2/io/stat.h>
++#include <psp2/kernel/threadmgr.h>
++
++// The port's diagnostic log, if it provides one (HM64: vita_log.cpp).
++extern "C" void ultramodern_vita_log(const char* message) __attribute__((weak));
++
++static void vita_save_log(const char* fmt, ...) {
++    if (ultramodern_vita_log == nullptr) {
++        return;
++    }
++    char message[512];
++    va_list args;
++    va_start(args, fmt);
++    vsnprintf(message, sizeof(message), fmt, args);
++    va_end(args);
++    ultramodern_vita_log(message);
++}
++
++static std::atomic<uint32_t> vita_sram_writes{0};
++static std::atomic<uint32_t> vita_sram_reads{0};
++static std::atomic<uint32_t> vita_file_saves{0};
++#endif
++
+ static std::vector<uint8_t> rom;
+ 
+ bool recomp::is_rom_loaded() {
+@@ -112,6 +140,45 @@ void set_save_file_path(const std::u8string& subfolder, const std::u8string& nam
+     save_context.save_file_path = save_folder_path / (name + u8".bin");
+ }
+ 
++#ifdef __vita__
++// Vita: write the save with the system's file calls and log every step. std::filesystem's copy_file, exists and
++// remove go through newlib on the Vita, and a failure there was never visible (HM64: "saves are not kept").
++// Same backup scheme as the other platforms: <name>.bin.temp is written, the old <name>.bin becomes <name>.bin.bak,
++// then the temp file becomes <name>.bin.
++void update_save_file() {
++    const std::string path = ultramodern::get_save_file_path().string();
++    const std::string temp = path + ".temp";
++    const std::string backup = path + ".bak";
++    const uint32_t save_index = ++vita_file_saves;
++
++    int write_result = -1;
++    size_t written = 0;
++    {
++        FILE* file = fopen(temp.c_str(), "wb");
++        if (file != nullptr) {
++            std::lock_guard lock{ save_context.save_buffer_mutex };
++            written = fwrite(save_context.save_buffer.data(), 1, save_context.save_buffer.size(), file);
++            write_result = (fclose(file) == 0 && written == save_context.save_buffer.size()) ? 0 : -2;
++        }
++    }
++    SceIoStat stat;
++    const bool had_file = sceIoGetstat(path.c_str(), &stat) >= 0;
++    int remove_backup = 0, to_backup = 0, to_file = -1;
++    if (write_result == 0) {
++        if (had_file) {
++            remove_backup = sceIoRemove(backup.c_str());  // fails harmlessly when there is no backup yet
++            to_backup = sceIoRename(path.c_str(), backup.c_str());
++        }
++        to_file = sceIoRename(temp.c_str(), path.c_str());
++    }
++    vita_save_log("save file #%u: %s, temp write %s (%u bytes), old file %s, remove .bak 0x%08X, old -> .bak 0x%08X, temp -> file 0x%08X",
++        (unsigned int)save_index, path.c_str(), write_result == 0 ? "ok" : (write_result == -1 ? "OPEN FAILED" : "WRITE FAILED"),
++        (unsigned int)written, had_file ? "present" : "absent", (unsigned int)remove_backup, (unsigned int)to_backup, (unsigned int)to_file);
++    if (write_result != 0 || to_file < 0) {
++        ultramodern::error_handling::message_box("Failed to write to the save file.");
++    }
++}
++#else
+ void update_save_file() {
+     bool saving_failed = false;
+     {
+@@ -132,10 +199,17 @@ void update_save_file() {
+         ultramodern::error_handling::message_box("Failed to write to the save file. Check your file permissions and whether the save folder has been moved to Dropbox or similar, as this can cause issues.");
+     }
+ }
++#endif
+ 
+ extern std::atomic_bool exited;
+ 
+ void saving_thread_func(RDRAM_ARG1) {
++#ifdef __vita__
++    // pthreads start at the lowest priority (191) on the Vita, which does not time-slice: give the saving thread a
++    // normal one so it is not left waiting behind busy threads.
++    const int priority_result = sceKernelChangeThreadPriority(0, 140);
++    vita_save_log("saving thread started, priority result 0x%08X", (unsigned int)priority_result);
++#endif
+     while (!exited) {
+         bool save_buffer_updated = false;
+         // Repeatedly wait for a new action to be sent.
+@@ -153,6 +227,9 @@ void saving_thread_func(RDRAM_ARG1) {
+ 
+         // If an action came through that affected the save file, save the updated contents.
+         if (save_buffer_updated) {
++#ifdef __vita__
++            vita_save_log("saving thread: %d save buffer change(s) to write", num_actions);
++#endif
+             update_save_file();
+         }
+ 
+@@ -238,6 +315,17 @@ void read_save_file() {
+         // Otherwise clear the save file to all zeroes.
+         std::fill(save_context.save_buffer.begin(), save_context.save_buffer.end(), 0);
+     }
++#ifdef __vita__
++    {
++        size_t nonzero = 0;
++        for (char c : save_context.save_buffer) nonzero += (c != 0);
++        SceIoStat stat;
++        const int dir_result = sceIoGetstat(save_file_path.parent_path().string().c_str(), &stat);
++        vita_save_log("save file read at boot: %s, %s, %u bytes read, %u non-zero bytes in the save buffer; save folder stat 0x%08X",
++            save_file_path.string().c_str(), save_file.good() || save_file.eof() ? "opened" : "not found (starting empty)",
++            (unsigned int)(save_file.good() || save_file.eof() ? save_file.gcount() : 0), (unsigned int)nonzero, (unsigned int)dir_result);
++    }
++#endif
+ }
+ 
+ void ultramodern::init_saving(RDRAM_ARG1) {
+@@ -283,6 +371,14 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
+             }
+             // read sram
+             save_read(rdram, rdram_address, physical_addr - recomp::sram_base, size);
++#ifdef __vita__
++            {
++                const uint32_t n = ++vita_sram_reads;
++                if (n <= 10 || (n % 100) == 0) {
++                    vita_save_log("SRAM read #%u: offset 0x%05X, %u bytes", (unsigned int)n, (unsigned int)(physical_addr - recomp::sram_base), (unsigned int)size);
++                }
++            }
++#endif
+ 
+             // Send a message to the mq to indicate that the transfer completed
+             ultramodern::enqueue_external_message(mq, 0, false, true);
+@@ -300,6 +396,14 @@ void do_dma(RDRAM_ARG PTR(OSMesgQueue) mq, gpr rdram_address, uint32_t physical_
+             }
+             // write sram
+             save_write(rdram, rdram_address, physical_addr - recomp::sram_base, size);
++#ifdef __vita__
++            {
++                const uint32_t n = ++vita_sram_writes;
++                if (n <= 20 || (n % 50) == 0) {
++                    vita_save_log("SRAM write #%u: offset 0x%05X, %u bytes", (unsigned int)n, (unsigned int)(physical_addr - recomp::sram_base), (unsigned int)size);
++                }
++            }
++#endif
+ 
+             // Send a message to the mq to indicate that the transfer completed
+             ultramodern::enqueue_external_message(mq, 0, false, true);
 diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
 index 1200f77..9a4a823 100644
 --- a/librecomp/src/recomp.cpp
@@ -380,10 +541,21 @@ index 8ca779e..1e250b8 100644
  #else
      std::quick_exit(exit_status);
 diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
-index 090cc42..baf3aec 100644
+index 090cc42..bed926d 100644
 --- a/ultramodern/src/events.cpp
 +++ b/ultramodern/src/events.cpp
-@@ -267,6 +267,19 @@ void dp_complete() {
+@@ -13,6 +13,10 @@
+ 
+ #include "ultramodern/ultra64.h"
+ #include "ultramodern/ultramodern.hpp"
++
++#ifdef __vita__
++#include <psp2/kernel/threadmgr.h>
++#endif
+ #include "ultramodern/extensions.h"
+ 
+ #include "ultramodern/rsp.hpp"
+@@ -267,9 +271,29 @@ void dp_complete() {
      ultramodern::enqueue_external_message(events_context.dp.mq, events_context.dp.msg, false, true);
  }
  
@@ -403,7 +575,17 @@ index 090cc42..baf3aec 100644
  void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_ready) {
      ultramodern::set_native_thread_name("SP Task Thread");
      ultramodern::set_native_thread_priority(ultramodern::ThreadPriority::Normal);
-@@ -356,7 +369,17 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
++#ifdef __vita__
++    // The audio microcode must finish before the game hands its buffer to the audio interface at the next retrace,
++    // as on the N64. At the gfx thread's priority (128) this thread sat ready but unscheduled while display lists
++    // ran (HM64 test 21), and stale audio buffers were played. Above the game threads (112) and gfx (128), below
++    // the VI (72) and timer (80) threads.
++    sceKernelChangeThreadPriority(0, 100);
++#endif
+ 
+     // Notify the caller thread that this thread is ready.
+     thread_ready->signal();
+@@ -356,7 +380,17 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
      while (!exited) {
          // Try to pull an action from the queue
          Action action;

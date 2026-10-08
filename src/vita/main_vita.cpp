@@ -1,7 +1,7 @@
 // PS Vita entry point for Harvest Moon 64: Recompiled (Phase 0: null renderer).
 //
 // The game runs with no graphics, audio or input. Display lists are counted and dropped, and a stats thread
-// (vita_stats.cpp) writes the counts, game CPU busy % and per-thread CPU time to ux0:data/hm64/phase0.log,
+// (vita_stats.cpp) writes the counts, game CPU busy % and per-thread CPU time to ux0:data/hm64/hm64.log,
 // so the game's CPU speed on the Vita can be measured before any GXM work starts.
 //
 // Every startup stage logs a checkpoint, so a crash dump plus the last log line shows where it stopped.
@@ -35,6 +35,7 @@
 #include "vita_rt64_context.h"
 #endif
 #include "vita_audio.h"
+#include "vita_debug_controls.h"
 #include "vita_log.h"
 #include "vita_selftest.h"
 #include "vita_stats.h"
@@ -52,9 +53,9 @@ extern "C" { unsigned int _newlib_heap_size_user = 256 * 1024 * 1024; }
 // by the system, so the work moves to a thread with a known stack, the same as my other ports.
 static const size_t game_main_stack_size = 2 * 1024 * 1024;
 
-// The code segment can end close to a 64 KB boundary, and vita-elf-create needs about 4.4 KB of free space
+// The code segment can end close to a 64 KB boundary, and vita-elf-create needs a few KB of free space
 // after it or the build fails with "segment 1 overlaps". This padding keeps the end of the segment clear of it.
-extern "C" __attribute__((used)) const unsigned char hm64_text_segment_padding[24 * 1024] = { 0 };
+extern "C" __attribute__((used)) const unsigned char hm64_text_segment_padding[32 * 1024] = { 0 };
 
 // Data folder on the memory card. The ROM must be placed here as hm64.us.z64.
 static const std::filesystem::path data_path = "ux0:data/hm64";
@@ -66,10 +67,15 @@ gpr get_entrypoint_address();
 extern RspUcodeFunc n_aspMain;
 
 // Times every audio microcode run, so the log shows its CPU cost and whether a run never returns.
+namespace hm64vita {
+    RspExitReason audio_hle_task(uint8_t* rdram, uint32_t ucode_addr);
+}
+
 static RspExitReason timed_n_aspMain(uint8_t* rdram, uint32_t ucode_addr) {
     hm64vita::timeline_event(hm64vita::TimelineEvent::AudioBegin);
     hm64vita::stats_audio_task_begin();
-    RspExitReason result = n_aspMain(rdram, ucode_addr);
+    // Native audio list processing (vita_audio_hle.cpp) in place of the recompiled microcode.
+    RspExitReason result = hm64vita::audio_hle_task(rdram, ucode_addr);
     hm64vita::stats_audio_task_end();
     hm64vita::timeline_event(hm64vita::TimelineEvent::AudioEnd);
     return result;
@@ -95,10 +101,30 @@ static void set_frequency(uint32_t freq) {
     hm64vita::audio_set_frequency(freq);
 }
 
-// Controller 1 from the Vita's buttons, following the PC version's default gamepad mapping:
-//   Cross = A, Square = B, Triangle = C left, Circle = C right, L = Z, R = R, Select = L, Start = Start,
-//   D-pad = D-pad, left stick = stick, right stick = C buttons.
+// Controller 1 from the Vita's buttons (layout chosen by the project's testers). What each N64 button does in
+// Harvest Moon comes from the decomp (src/game/player.c):
+//   Cross = A (interact, talk, lift, throw, confirm)      Circle = B (use tool, cancel, back)
+//   Triangle = Start (main menu)                          Start = Z (inspect) in gameplay, Start everywhere else
+//   L = L, R = R (rotate the camera)                      right stick = C buttons (rucksack, horse, dog, eat)
+//   D-pad and left stick = stick (movement and menus). The game never reads the N64 D-pad, so the Vita D-pad
+//   drives the stick at full tilt. Square and Select are unused.
 static SceCtrlData ctrl_state;
+
+namespace hm64vita {
+    uint8_t* rdram_pointer();  // vita_audio_hle.cpp; null until the first audio task
+}
+
+// True while the game is in normal gameplay: mainLoopCallbackCurrentIndex (u16 at 0x8020564A, from the decomp's
+// symbol list) is MAIN_GAME (1). Menus, the title and naming screens, dialogue and cutscenes use other values.
+static bool in_gameplay() {
+    const uint8_t* rdram = hm64vita::rdram_pointer();
+    if (rdram == nullptr) {
+        return false;
+    }
+    const uint32_t address = 0x0020564A;
+    const uint16_t mode = *reinterpret_cast<const uint16_t*>(rdram + (address ^ 2));
+    return mode == 1;
+}
 static std::atomic<uint32_t> ctrl_polls{0};
 static std::atomic<uint32_t> ctrl_reads{0};
 static uint32_t ctrl_logged_buttons = 0;
@@ -144,23 +170,20 @@ static bool get_input(int controller_num, uint16_t* buttons, float* x, float* y)
     struct Mapping { uint32_t vita; uint16_t n64; };
     static const Mapping mappings[] = {
         { SCE_CTRL_CROSS, 0x8000 },     // A
-        { SCE_CTRL_SQUARE, 0x4000 },    // B
-        { SCE_CTRL_LTRIGGER, 0x2000 },  // Z
-        { SCE_CTRL_SELECT, 0x0020 },    // L
+        { SCE_CTRL_CIRCLE, 0x4000 },    // B
+        { SCE_CTRL_TRIANGLE, 0x1000 },  // Start
+        { SCE_CTRL_LTRIGGER, 0x0020 },  // L
         { SCE_CTRL_RTRIGGER, 0x0010 },  // R
-        { SCE_CTRL_START, 0x1000 },     // Start
-        { SCE_CTRL_TRIANGLE, 0x0002 },  // C left
-        { SCE_CTRL_CIRCLE, 0x0001 },    // C right
-        { SCE_CTRL_UP, 0x0800 },
-        { SCE_CTRL_DOWN, 0x0400 },
-        { SCE_CTRL_LEFT, 0x0200 },
-        { SCE_CTRL_RIGHT, 0x0100 },
     };
     uint16_t result = 0;
     for (const Mapping& m : mappings) {
         if (data.buttons & m.vita) {
             result |= m.n64;
         }
+    }
+    // Vita Start: Z (inspect the held item) in gameplay, Start in menus and on screens that say "push Start".
+    if (data.buttons & SCE_CTRL_START) {
+        result |= in_gameplay() ? 0x2000 : 0x1000;
     }
 
     // Right stick as C buttons.
@@ -172,7 +195,15 @@ static bool get_input(int controller_num, uint16_t* buttons, float* x, float* y)
     if (ry > 0.5f) result |= 0x0004;
     *buttons = result;
 
-    // Left stick, with a small radial dead zone. The Vita's y axis points down; the N64's points up.
+    // D-pad as the stick at full tilt; otherwise the left stick, with a small radial dead zone. The Vita's y axis
+    // points down; the N64's points up.
+    const float dx = ((data.buttons & SCE_CTRL_RIGHT) ? 1.0f : 0.0f) - ((data.buttons & SCE_CTRL_LEFT) ? 1.0f : 0.0f);
+    const float dy = ((data.buttons & SCE_CTRL_UP) ? 1.0f : 0.0f) - ((data.buttons & SCE_CTRL_DOWN) ? 1.0f : 0.0f);
+    if (dx != 0.0f || dy != 0.0f) {
+        *x = dx;
+        *y = dy;
+        return true;
+    }
     const float lx = stick_axis(data.lx);
     const float ly = -stick_axis(data.ly);
     if (lx * lx + ly * ly > 0.12f * 0.12f) {
@@ -328,6 +359,7 @@ int main(int argc, char** argv) {
     const int ctrl_mode = sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG);
     hm64vita::log_line("input: sceCtrlSetSamplingMode returned 0x%08X", (unsigned int)ctrl_mode);
     hm64vita::audio_init();
+    hm64vita::debug_controls_start();
 
     // The stats thread also runs the hang watchdog, so it starts before anything that could hang.
     hm64vita::stats_start();
