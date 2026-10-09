@@ -31,6 +31,7 @@ const char* hm64vita::rt64_zone_name(int zone) {
         "fullSync", "fs.flush", "fs.tilesValidate", "fs.fillPairs", "fs.upload", "fs.uberWait",
         "fs.renderToRAM", "fs.pairTiles", "fs.evictToAdvance", "fs.queueAdvance",
         "setVertex", "loadDrawState", "rdpLoad", "checkRDRAM", "fbHash", "drawTri",
+        "fs.tileLoads", "fs.tileUploads", "flush", "matrix", "updateScreen", "gxmRender",
     };
     return (zone >= 0 && zone < RT64_ZONE_COUNT) ? names[zone] : "?";
 }

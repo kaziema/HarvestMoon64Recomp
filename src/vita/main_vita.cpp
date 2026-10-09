@@ -34,6 +34,7 @@
 #if defined(HM64_VITA_RT64)
 #include "vita_rt64_context.h"
 #endif
+#include "gxm/rt64_gxm_renderer.h"
 #include "vita_audio.h"
 #include "vita_debug_controls.h"
 #include "vita_log.h"
@@ -107,7 +108,8 @@ static void set_frequency(uint32_t freq) {
 //   Triangle = Start (main menu)                          Start = Z (inspect) in gameplay, Start everywhere else
 //   L = L, R = R (rotate the camera)                      right stick = C buttons (rucksack, horse, dog, eat)
 //   D-pad and left stick = stick (movement and menus). The game never reads the N64 D-pad, so the Vita D-pad
-//   drives the stick at full tilt. Square and Select are unused.
+//   drives the stick at full tilt. Square is unused; Select captures the current frame for bug reports
+//   (screen image, every draw call and its textures, saved to ux0:data/hm64/capture_select<N>_*).
 static SceCtrlData ctrl_state;
 
 namespace hm64vita {
@@ -144,6 +146,17 @@ static void poll_input() {
         }
         return;
     }
+    // Select: frame capture for bug reports (rt64-gxm), once per press.
+    static bool select_was_down = false;
+    static uint32_t select_captures = 0;
+    const bool select_down = (data.buttons & SCE_CTRL_SELECT) != 0;
+    if (select_down && !select_was_down) {
+        char prefix[64];
+        snprintf(prefix, sizeof(prefix), "ux0:data/hm64/capture_select%u", (unsigned int)++select_captures);
+        rt64gxm::request_capture(prefix);
+        hm64vita::log_line("input: Select pressed, frame capture requested (%s)", prefix);
+    }
+    select_was_down = select_down;
     ctrl_state = data;
     if (polls == 0) {
         hm64vita::log_line("input: first poll, buttons 0x%08X, sticks %u,%u %u,%u", (unsigned int)data.buttons,

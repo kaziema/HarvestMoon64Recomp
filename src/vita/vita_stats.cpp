@@ -20,6 +20,7 @@
 #endif
 #include "vita_log.h"
 #include "vita_timeline.h"
+#include "gxm/rt64_gxm_renderer.h"
 
 // VI interrupt counter in ultramodern's events.cpp. Only the low word is read (one aligned 32-bit load),
 // so a read can never be torn.
@@ -140,6 +141,15 @@ namespace {
             uint64_t start_us;
             last_idle_us = idle_wait_total_us(&last_waits, &start_us, last_us);
         }
+
+        // Always-on frame time summary, every 30 seconds (one log line), when diagnostics are off.
+        uint64_t window_start_us = last_us;
+        uint32_t window_dl = 0, window_vi = last_vi, window_audio = 0;
+        uint64_t window_idle_us = last_idle_us, window_audio_us = 0, window_dl_us = 0, window_screen_us = 0, window_renderer_us = 0;
+        uint32_t window_renderer_frames = 0;
+#if defined(HM64_VITA_RT64)
+        uint64_t window_zone_us[RT64_ZONE_COUNT] = {};
+#endif
 
         // Watchdog state.
         uint32_t progress_dl = 0;
@@ -281,6 +291,47 @@ namespace {
                     log_thread_table("every 5 s", now - last_table_us);
                     last_table_us = now;
                 }
+            }
+
+            if (!hm64vita::diagnostics() && (seconds % 30) == 0) {
+                const uint64_t span_us = now - window_start_us;
+                const uint32_t frames = dl - window_dl;
+                const hm64vita::RendererTimes rt = hm64vita::take_renderer_times();
+                const rt64gxm::Stats gxm = rt64gxm::get_stats();
+                const uint64_t idle = idle_us - window_idle_us;
+                const uint32_t busy_pct = span_us ? uint32_t(((span_us > idle ? span_us - idle : 0) * 100) / span_us) : 0;
+                const uint32_t audio_tasks = audio_count - window_audio;
+                const uint32_t renderer_frames = gxm.frames - window_renderer_frames;
+                char zones[200] = "";
+#if defined(HM64_VITA_RT64)
+                uint64_t zone_us[RT64_ZONE_COUNT];
+                uint32_t zone_calls[RT64_ZONE_COUNT];
+                hm64vita::rt64_zone_totals(zone_us, zone_calls);
+                int zl = 0;
+                for (int z = 0; z < RT64_ZONE_COUNT && zl >= 0 && zl < (int)sizeof(zones); z++) {
+                    const uint64_t per_frame = frames ? (zone_us[z] - window_zone_us[z]) / frames : 0;
+                    if (per_frame >= 300) {  // only the zones worth reading (0.3 ms per frame or more)
+                        zl += snprintf(zones + zl, sizeof(zones) - zl, " %s %.1f", hm64vita::rt64_zone_name(z), per_frame / 1000.0);
+                    }
+                    window_zone_us[z] = zone_us[z];
+                }
+#endif
+                hm64vita::log_line("frame time, last %u s: %.1f fps (VIs %.1f/s), game busy %u%% | per frame ms: send_dl %.1f (max %.1f), update_screen %.1f, gxm renderer %.1f, audio task %.1f (x%.1f per frame) | RT64 zones ms/frame:%s",
+                    (unsigned int)(span_us / 1000000), span_us ? frames * 1e6 / span_us : 0.0, span_us ? (vi - window_vi) * 1e6 / span_us : 0.0, (unsigned int)busy_pct,
+                    frames ? (rt.display_list_us - window_dl_us) / 1000.0 / frames : 0.0, rt.display_list_max_us / 1000.0,
+                    frames ? (rt.screen_update_us - window_screen_us) / 1000.0 / frames : 0.0,
+                    renderer_frames ? (gxm.cpu_us - window_renderer_us) / 1000.0 / renderer_frames : 0.0,
+                    audio_tasks ? (audio_us - window_audio_us) / 1000.0 / audio_tasks : 0.0, frames ? double(audio_tasks) / frames : 0.0, zones);
+                window_start_us = now;
+                window_dl = dl;
+                window_vi = vi;
+                window_audio = audio_count;
+                window_idle_us = idle_us;
+                window_audio_us = audio_us;
+                window_dl_us = rt.display_list_us;
+                window_screen_us = rt.screen_update_us;
+                window_renderer_us = gxm.cpu_us;
+                window_renderer_frames = gxm.frames;
             }
 
             // Hang watchdog.
